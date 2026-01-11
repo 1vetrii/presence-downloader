@@ -3,32 +3,51 @@ import { create } from 'youtube-dl-exec';
 import path from 'path';
 import fs from 'fs';
 import { Readable } from 'stream';
+// 1. Import the smart FFmpeg finder
+import ffmpegPath from 'ffmpeg-static'; 
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 300;
+export const maxDuration = 60; // Vercel Free Tier limit is usually 10-60s
 
-// CHANGE: We now use GET to allow direct browser downloads
 export async function GET(request: Request) {
   const uniqueId = Date.now();
   const { searchParams } = new URL(request.url);
   const url = searchParams.get('url');
 
-  // 1. Resolve Paths
+  // 2. Detect Operating System
+  const isWindows = process.platform === 'win32';
   const cwd = process.cwd();
-  const ytDlpPath = path.resolve(cwd, 'yt-dlp.exe');
-  const ffmpegPath = path.resolve(cwd, 'ffmpeg.exe');
-  const tempTemplate = path.join(cwd, `temp-${uniqueId}.%(ext)s`);
-  const finalFilePath = path.join(cwd, `temp-${uniqueId}.wav`);
+
+  // 3. Select the correct yt-dlp binary
+  const ytDlpFilename = isWindows ? 'yt-dlp.exe' : 'yt-dlp_linux';
+  const ytDlpPath = path.resolve(cwd, ytDlpFilename);
+  
+  // 4. Use the path from the ffmpeg-static package (it handles OS auto-magic)
+  // Fallback to local 'ffmpeg.exe' if on Windows and the package fails for some reason
+  const finalFfmpegPath = ffmpegPath || path.resolve(cwd, 'ffmpeg.exe');
+
+  const tempTemplate = path.join('/tmp', `temp-${uniqueId}.%(ext)s`);
+  const finalFilePath = path.join('/tmp', `temp-${uniqueId}.wav`);
+  // Note: On Vercel, we MUST use /tmp for writing files. 
+  // On local Windows, /tmp usually maps to the drive root or we can fallback.
+  const outputTemplate = isWindows ? path.join(cwd, `temp-${uniqueId}.%(ext)s`) : tempTemplate;
+  const outputFinal = isWindows ? path.join(cwd, `temp-${uniqueId}.wav`) : finalFilePath;
 
   try {
     if (!url) throw new Error('No URL provided');
-    console.log(`[${uniqueId}] Requesting: ${url}`);
+    console.log(`[${uniqueId}] System: ${process.platform}`);
+    console.log(`[${uniqueId}] Using yt-dlp: ${ytDlpPath}`);
+    console.log(`[${uniqueId}] Using ffmpeg: ${finalFfmpegPath}`);
 
-    // 2. Check Files
-    if (!fs.existsSync(ytDlpPath)) throw new Error('MISSING: yt-dlp.exe');
-    if (!fs.existsSync(ffmpegPath)) throw new Error('MISSING: ffmpeg.exe');
+    // 5. Critical: Linux binaries lose permissions during upload. We must fix them.
+    if (!isWindows && fs.existsSync(ytDlpPath)) {
+      try { fs.chmodSync(ytDlpPath, 0o755); } catch (e) {}
+    }
 
-    // 3. Convert
+    if (!fs.existsSync(ytDlpPath)) {
+      throw new Error(`Engine missing: ${ytDlpFilename} not found in root.`);
+    }
+
     const youtubedl = create(ytDlpPath);
     await youtubedl(url, {
       noCheckCertificates: true,
@@ -36,15 +55,15 @@ export async function GET(request: Request) {
       preferFreeFormats: true,
       extractAudio: true,
       audioFormat: 'wav',
-      output: tempTemplate,
-      ffmpegLocation: ffmpegPath
+      output: outputTemplate,
+      ffmpegLocation: finalFfmpegPath
     });
 
-    if (!fs.existsSync(finalFilePath)) throw new Error('Conversion failed');
+    if (!fs.existsSync(outputFinal)) throw new Error('Conversion failed');
 
-    // 4. Stream to Browser
-    const stats = fs.statSync(finalFilePath);
-    const nodeStream = fs.createReadStream(finalFilePath);
+    // 6. Stream
+    const stats = fs.statSync(outputFinal);
+    const nodeStream = fs.createReadStream(outputFinal);
     const stream = new ReadableStream({
       start(controller) {
         nodeStream.on('data', (chunk) => controller.enqueue(chunk));
@@ -53,15 +72,14 @@ export async function GET(request: Request) {
       },
     });
 
-    // 5. Cleanup Hook (60s)
+    // Cleanup
     setTimeout(() => {
-      try { if (fs.existsSync(finalFilePath)) fs.unlinkSync(finalFilePath); } catch (e) {}
+      try { if (fs.existsSync(outputFinal)) fs.unlinkSync(outputFinal); } catch (e) {}
     }, 60000);
 
     const headers = new Headers();
     headers.set('Content-Disposition', `attachment; filename="audio-${uniqueId}.wav"`);
     headers.set('Content-Type', 'audio/wav');
-    // Note: No Content-Length to avoid mismatch errors
 
     return new NextResponse(stream, { headers });
 
